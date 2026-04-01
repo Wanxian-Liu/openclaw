@@ -1,7 +1,13 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { describe, expect, it } from "vitest";
-import { castAgentMessage } from "../test-helpers/agent-message-fixtures.js";
-import { dropThinkingBlocks, isAssistantMessageWithContent } from "./thinking.js";
+import { castAgentMessage, castAgentMessages } from "../test-helpers/agent-message-fixtures.js";
+import {
+  assessLastAssistantMessage,
+  dropThinkingBlocks,
+  isAssistantMessageWithContent,
+  sanitizeThinkingForRecovery,
+  wrapAnthropicStreamWithRecovery,
+} from "./thinking.js";
 
 function dropSingleAssistantContent(content: Array<Record<string, unknown>>) {
   const messages: AgentMessage[] = [
@@ -93,5 +99,168 @@ describe("dropThinkingBlocks", () => {
       { type: "thinking", thinking: "latest", thinkingSignature: "sig_latest" },
       { type: "text", text: "latest text" },
     ]);
+  });
+});
+
+describe("sanitizeThinkingForRecovery", () => {
+  it("drops the latest assistant message when the thinking block is unsigned", () => {
+    const messages = castAgentMessages([
+      { role: "user", content: "hello" },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "partial" }],
+      },
+    ]);
+
+    const result = sanitizeThinkingForRecovery(messages);
+    expect(result.messages).toEqual([messages[0]]);
+    expect(result.prefill).toBe(false);
+  });
+
+  it("preserves later turns when dropping an incomplete assistant message", () => {
+    const messages = castAgentMessages([
+      { role: "user", content: "hello" },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "partial" }],
+      },
+      { role: "user", content: "follow up" },
+    ]);
+
+    const result = sanitizeThinkingForRecovery(messages);
+    expect(result.messages).toEqual([messages[0], messages[2]]);
+    expect(result.prefill).toBe(false);
+  });
+
+  it("marks signed thinking without text as a prefill recovery case", () => {
+    const messages = castAgentMessages([
+      { role: "user", content: "hello" },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "complete", thinkingSignature: "sig" }],
+      },
+    ]);
+
+    const result = sanitizeThinkingForRecovery(messages);
+    expect(result.messages).toBe(messages);
+    expect(result.prefill).toBe(true);
+  });
+
+  it("marks signed thinking with an empty text block as incomplete text", () => {
+    const message = castAgentMessage({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "complete", thinkingSignature: "sig" },
+        { type: "text", text: "" },
+      ],
+    });
+
+    expect(assessLastAssistantMessage(message)).toBe("incomplete-text");
+  });
+
+  it("treats partial text after signed thinking as valid", () => {
+    const message = castAgentMessage({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "complete", thinkingSignature: "sig" },
+        { type: "text", text: "Here is my answ" },
+      ],
+    });
+
+    expect(assessLastAssistantMessage(message)).toBe("valid");
+  });
+
+  it("treats non-string text blocks as incomplete text when thinking is signed", () => {
+    const message = castAgentMessage({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "complete", thinkingSignature: "sig" },
+        { type: "text", text: { bad: true } },
+      ],
+    });
+
+    expect(assessLastAssistantMessage(message)).toBe("incomplete-text");
+  });
+});
+
+describe("wrapAnthropicStreamWithRecovery", () => {
+  const anthropicThinkingError = new Error(
+    "thinking or redacted_thinking blocks in the latest assistant message cannot be modified",
+  );
+
+  it("retries once when the request is rejected before streaming", async () => {
+    let callCount = 0;
+    const wrapped = wrapAnthropicStreamWithRecovery(
+      (() => {
+        callCount += 1;
+        return Promise.reject(anthropicThinkingError);
+      }) as Parameters<typeof wrapAnthropicStreamWithRecovery>[0],
+      { id: "test-session" },
+    );
+
+    await expect(
+      wrapped(
+        {} as never,
+        {
+          messages: castAgentMessages([
+            {
+              role: "assistant",
+              content: [{ type: "thinking", thinking: "secret", thinkingSignature: "sig" }],
+            },
+          ]),
+        } as never,
+        {} as never,
+      ),
+    ).rejects.toBe(anthropicThinkingError);
+    expect(callCount).toBe(2);
+  });
+
+  it("retries once when the stream throws during iteration", async () => {
+    let callCount = 0;
+    const wrapped = wrapAnthropicStreamWithRecovery(
+      (() => {
+        callCount += 1;
+        return (async function* failingStream() {
+          yield "chunk";
+          throw anthropicThinkingError;
+        })();
+      }) as unknown as Parameters<typeof wrapAnthropicStreamWithRecovery>[0],
+      { id: "test-session" },
+    );
+
+    const chunks: unknown[] = [];
+    let caughtError: unknown;
+    try {
+      for await (const chunk of wrapped(
+        {} as never,
+        { messages: [] } as never,
+        {} as never,
+      ) as AsyncIterable<unknown>) {
+        chunks.push(chunk);
+      }
+    } catch (error: unknown) {
+      caughtError = error;
+    }
+
+    expect(chunks).toEqual(["chunk", "chunk"]);
+    expect(caughtError).toBe(anthropicThinkingError);
+    expect(callCount).toBe(2);
+  });
+
+  it("does not retry non-Anthropic-thinking errors", async () => {
+    const rateLimitError = new Error("rate limit exceeded");
+    let callCount = 0;
+    const wrapped = wrapAnthropicStreamWithRecovery(
+      (() => {
+        callCount += 1;
+        return Promise.reject(rateLimitError);
+      }) as Parameters<typeof wrapAnthropicStreamWithRecovery>[0],
+      { id: "test-session" },
+    );
+
+    await expect(wrapped({} as never, { messages: [] } as never, {} as never)).rejects.toBe(
+      rateLimitError,
+    );
+    expect(callCount).toBe(1);
   });
 });
