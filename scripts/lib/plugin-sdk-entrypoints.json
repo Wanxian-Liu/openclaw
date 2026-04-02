@@ -190,6 +190,7 @@
   "provider-stream",
   "provider-tools",
   "provider-usage",
+  "provider-web-fetch",
   "provider-web-search",
   "retry-runtime",
   "param-readers",
